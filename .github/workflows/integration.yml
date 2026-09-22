@@ -1,0 +1,251 @@
+name: Integration
+
+# Integration pipeline, complementing ci.yml (build/lint/docs):
+#
+#   coverage            (ubuntu) Rust workspace coverage via cargo-llvm-cov
+#                       with a line-coverage GATE, plus Go / Python / TS SDK
+#                       coverage numbers merged into the job summary.
+#   integration-linux   (ubuntu) workspace tests incl. the pure-Rust
+#                       cross-platform tests/integration.rs, TS/Go/Python SDK
+#                       interop vs the Rust binary, the 6-direction
+#                       cross-language matrix, and the POSIX-ified bash sync
+#                       suites.
+#   integration-windows (windows) the windows-proven bash suites: full E2E
+#                       sync, edge cases (exclusive file locks are a Win32
+#                       sharing-mode concern — the suite SKIPS on POSIX), and
+#                       the deletion-semantics probe.
+#
+# All three jobs run in parallel and fail independently (no fail-fast across
+# jobs); every Rust job rides Swatinem/rust-cache.
+#
+# Note: interop/test-interop.mjs (Node REFERENCE implementation <-> Rust) is
+# a local-only suite — it hard-depends on the sibling `ectun` reference repo
+# (file:///…/ectun/lib/index.mjs). The Node<->Rust direction that CAN run in
+# CI is sdks/typescript's interop (below); the reference-impl suite stays a
+# developer-machine check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Line-coverage floor for the Rust workspace (all crates incl. the app
+  # binaries the integration tests spawn, zstd on), measured with
+  # cargo-llvm-cov + raw llvm-cov (see coverage job): 60.9% locally, gate
+  # set 5pp below so routine refactors don't trip it while real regressions
+  # do.
+  COVERAGE_GATE: 55
+
+jobs:
+  coverage:
+    name: Coverage & gate (rust + go + py + ts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ECTUN_BIN: ${{ github.workspace }}/target/release/krymux-tunnel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # "External tests" recipe from cargo-llvm-cov: instrument everything,
+      # run the suite (tests/integration.rs spawns the instrumented
+      # krymux-sync/tunnel binaries via KRYMUX_*_BIN; LLVM_PROFILE_FILE
+      # propagates to them, so the sync-engine code merges into the report),
+      # then export with raw llvm tools — every binary after the first MUST
+      # be passed as `-object` (positional extras are silently ignored) and
+      # the app binaries must be listed or their code counts as 0%.
+      # NOTE: `clean --workspace` deletes release artifacts too, so the
+      # release build for the SDK steps below comes AFTER this step.
+      # (Branch counters need nightly -Z coverage-options=branch — the gate
+      # is on line coverage.)
+      - name: Rust coverage (workspace, zstd)
+        run: |
+          set -e
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo build --workspace --features krymux/zstd --bins
+          KRYMUX_SYNC_BIN="$PWD/target/debug/krymux-sync" \
+          KRYMUX_TUNNEL_BIN="$PWD/target/debug/krymux-tunnel" \
+            cargo test --workspace --features krymux/zstd
+          LB="$(find "$(rustc --print sysroot)/lib/rustlib" -name llvm-profdata -printf '%h\n' | head -1)"
+          "$LB/llvm-profdata" merge -sparse target/*.profraw -o target/all.profdata
+          FIRST=""; OBJS=""
+          for o in target/debug/krymux-tunnel target/debug/krymux-sync \
+                   target/debug/deps/integration-* target/debug/deps/krymux-* \
+                   target/debug/deps/mux_regression-* target/debug/deps/udp_relay-*; do
+            case "$o" in *deps/krymux_s*|*deps/krymux_t*) continue;; esac
+            [ -e "$o" ] || continue
+            if [ -z "$FIRST" ]; then FIRST="$o"; else OBJS="$OBJS -object $o"; fi
+          done
+          # shellcheck disable=SC2086
+          "$LB/llvm-cov" export -format=lcov -instr-profile=target/all.profdata \
+            --ignore-filename-regex '.cargo' $FIRST $OBJS > coverage.lcov
+
+      # release binaries are the interop partner for the Go/Python/TS SDK
+      # tests below (they spawn krymux-tunnel) — built AFTER the coverage
+      # step, whose clean would remove them
+      - name: Build release binaries
+        run: cargo build --release --workspace --features krymux/zstd
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Go SDK tests + coverage
+        working-directory: sdks/golang
+        run: |
+          go test ./... -coverprofile=cover.out
+          GO_COV="$(go tool cover -func=cover.out | tail -1 | grep -oE '[0-9.]+%' | tail -1)"
+          echo "GO_COV=$GO_COV" >> "$GITHUB_ENV"
+          echo "go: $GO_COV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python SDK tests + coverage
+        working-directory: sdks/python
+        run: |
+          python -m pip install --quiet pytest pytest-asyncio pytest-cov cryptography
+          PY_COV="$(python -m pytest tests --cov=krymux --cov-report=term | awk '/^TOTAL/{gsub(/%/,"",$NF); print $NF"%"}')"
+          echo "PY_COV=$PY_COV" >> "$GITHUB_ENV"
+          echo "python: $PY_COV"
+
+      - name: TypeScript SDK interop + coverage (c8 over tsx)
+        working-directory: sdks/typescript
+        continue-on-error: true   # tsx/c8 source-map coverage is best-effort
+        run: |
+          npm ci
+          npx --yes c8 --reporter=text-summary tsx scripts/interop-with-rust.ts | tee c8-summary.txt
+          TS_COV="$(grep -oE 'Lines ?: [0-9.]+%' c8-summary.txt | grep -oE '[0-9.]+%' | tail -1)"
+          echo "TS_COV=${TS_COV:-n/a}" >> "$GITHUB_ENV"
+          echo "typescript: ${TS_COV:-n/a}"
+
+      - name: Coverage gate + summary
+        run: |
+          # llvm-cov lcov records per-line DA:<line>,<count> — compute from those
+          LF=$(awk -F, '/^DA:/{t++} END{print t+0}' coverage.lcov)
+          LH=$(awk -F, '/^DA:/{if ($2>0) h++} END{print h+0}' coverage.lcov)
+          LINE=$(awk -v h="$LH" -v f="$LF" 'BEGIN{if (f>0) printf "%.2f", 100*h/f; else print "0"}')
+          echo "rust line=$LINE% (gate ${COVERAGE_GATE}%)"
+          {
+            echo "## Coverage"
+            echo
+            echo "| Language | Line coverage |"
+            echo "|---|---|"
+            echo "| Rust (workspace, zstd) | $LINE% (gate: ${COVERAGE_GATE}%) |"
+            echo "| Go (sdks/golang) | ${GO_COV:-n/a} |"
+            echo "| Python (sdks/python) | ${PY_COV:-n/a} |"
+            echo "| TypeScript (sdks/typescript) | ${TS_COV:-n/a} |"
+            echo
+            echo "Rust branch counters require a nightly compiler (\`-Z coverage-options=branch\`); the gate enforces line coverage on stable."
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk -v x="$LINE" -v g="$COVERAGE_GATE" 'BEGIN{exit !(x>=g)}' || {
+            echo "::error::Rust line coverage $LINE% is below the gate $COVERAGE_GATE%"
+            exit 1
+          }
+
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: coverage.lcov
+
+  integration-linux:
+    name: Integration (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ECTUN_BIN: ${{ github.workspace }}/target/release/krymux-tunnel
+      # fail loudly if the sync binaries are missing instead of skipping
+      KRYMUX_INTEGRATION_REQUIRE_BINS: "1"
+      XLANG_PY: python3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (debug for tests, release for SDK/bash partners)
+        run: |
+          cargo build --workspace --features krymux/zstd
+          cargo build --release --workspace --features krymux/zstd
+
+      - name: Workspace tests (incl. cross-platform tests/integration.rs)
+        run: cargo test --workspace --features krymux/zstd
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: TypeScript SDK interop (node <-> rust)
+        working-directory: sdks/typescript
+        run: |
+          npm ci
+          npm run test:interop
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Go SDK interop (go <-> rust)
+        working-directory: sdks/golang
+        run: go test ./...
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python SDK interop (python <-> rust)
+        working-directory: sdks/python
+        run: |
+          python -m pip install --quiet pytest pytest-asyncio cryptography
+          python -m pytest tests
+
+      - name: Cross-language matrix (ts/go/py, 6 directions)
+        run: bash scripts/xlang-matrix.sh
+
+      - name: E2E sync suite (bash)
+        run: bash e2e-sync-test.sh
+
+      - name: Deletion semantics probe (bash)
+        if: always()
+        run: bash deletion-semantics-probe.sh
+
+  integration-windows:
+    name: Integration (windows bash suites)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace --features krymux/zstd
+
+      - name: E2E sync suite (14 phases)
+        run: bash e2e-sync-test.sh
+
+      - name: Edge-case suite (locks, crash recovery)
+        if: always()
+        run: bash edge-e2e.sh
+
+      - name: Deletion semantics probe
+        if: always()
+        run: bash deletion-semantics-probe.sh

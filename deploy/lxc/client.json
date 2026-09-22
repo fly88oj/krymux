@@ -1,0 +1,6 @@
+{
+  "endpoint": "10.0.0.10:39443",
+  "identity": {"key": "/etc/ectun/keys/cli.key.pem", "cert": "/etc/ectun/keys/cli.crt.pem"},
+  "serverFingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "keepaliveSec": 10
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=ectun tunnel server (mTLS reverse proxy)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/krymux-tunnel server --config /etc/ectun/server.json
+Restart=always
+RestartSec=2
+Environment=KRYMUX_LOG=info
+
+[Install]
+WantedBy=multi-user.target

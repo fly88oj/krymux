@@ -1,0 +1,12 @@
+[Unit]
+Description=ectun file sync daemon C (watch mode)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/krymux-sync sync-client --path /data --config /etc/ectun/client.json --watch --interval 30
+Restart=always
+RestartSec=2
+Environment=KRYMUX_LOG=info
+
+[Install]
+WantedBy=multi-user.target

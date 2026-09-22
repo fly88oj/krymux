@@ -1,0 +1,12 @@
+[Unit]
+Description=ectun file sync server (behind the tunnel)
+After=ectun-server.service
+
+[Service]
+ExecStart=/usr/local/bin/krymux-sync sync-server --path /data --port 17890
+Restart=always
+RestartSec=2
+Environment=KRYMUX_LOG=info
+
+[Install]
+WantedBy=multi-user.target

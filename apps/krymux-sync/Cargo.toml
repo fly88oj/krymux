@@ -1,0 +1,21 @@
+[package]
+name = "krymux-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Krymux FileSync — bidirectional file synchronization (sync-server / sync-client) over krymux tunnels"
+license = "MIT"
+
+[dependencies]
+krymux = { path = "../../crates/krymux" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+hex = "0.4"
+walkdir = "2"
+filetime = "0.2"
+notify = "8.2.0"
+anyhow = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }

@@ -1,0 +1,23 @@
+# Rust
+/target/
+/target-native/
+**/*.rs.bk
+
+# Benchmark / test artifacts
+bench/logs/
+*.log
+*.log.attempt*
+
+# Runtime sync metadata (never commit a synced tree)
+.sync-*
+*.sync-tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+node_modules/
+__pycache__/
+*.pyc
