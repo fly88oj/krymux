@@ -106,7 +106,8 @@ class Compressor:
         if not data:
             return b""
         if self._algo == ALGO_NONE:
-            return bytes(data)
+            # callers hand us immutable byte slices; pass them through
+            return data
         out = self._z.compress(data) + self._z.flush(zlib.Z_SYNC_FLUSH)
         return out
 
@@ -127,7 +128,7 @@ class Decompressor:
         if not wire:
             return b""
         if self._algo == ALGO_NONE:
-            return bytes(wire)
+            return wire
         return self._z.decompress(wire)
 
     def finish(self) -> bytes:

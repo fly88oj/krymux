@@ -22,20 +22,17 @@ export const SUPPORTED: readonly string[] = [ALGO_NONE, ALGO_DEFLATE];
 /** Context handle shared by both directions of one stream. */
 export interface CompCtx {
   write(buf: Buffer): Promise<Buffer | null>;
-  flush(): Promise<Buffer | null>;
   end(): Promise<Buffer | null>;
   destroy(): void;
 }
 
 class ZCtx implements CompCtx {
   private readonly z: zlib.DeflateRaw | zlib.InflateRaw;
-  private readonly flushOp: number | undefined;
   private readonly parts: Buffer[] = [];
   private err: Error | null = null;
 
-  constructor(z: zlib.DeflateRaw | zlib.InflateRaw, flushOp: number | undefined) {
+  constructor(z: zlib.DeflateRaw | zlib.InflateRaw) {
     this.z = z;
-    this.flushOp = flushOp;
     z.on('data', (d: Buffer) => this.parts.push(d));
     z.on('error', (e: Error) => {
       this.err = e;
@@ -53,17 +50,6 @@ class ZCtx implements CompCtx {
     return new Promise((res, rej) => {
       if (this.err) return rej(this.err);
       this.z.write(buf, (e) => (e ? rej(e) : res(this._collect())));
-    });
-  }
-
-  flush(): Promise<Buffer | null> {
-    return new Promise((res, rej) => {
-      if (this.err) return rej(this.err);
-      // rest-arg wrapper: @types/node types the zlib flush callback as () => void,
-      // but the runtime passes the error as the first argument.
-      const done = (...args: [err?: Error | null]) => (args[0] ? rej(args[0]) : res(this._collect()));
-      if (this.flushOp === undefined) this.z.flush(done); // stream-type default op
-      else this.z.flush(this.flushOp, done);
     });
   }
 
@@ -97,10 +83,6 @@ class ZCtx implements CompCtx {
 class PassCtx implements CompCtx {
   write(buf: Buffer): Promise<Buffer | null> {
     return Promise.resolve(buf.length ? buf : null);
-  }
-
-  flush(): Promise<Buffer | null> {
-    return Promise.resolve(null);
   }
 
   async end(): Promise<Buffer | null> {
@@ -179,17 +161,21 @@ export function looksPrecompressed(chunk: Buffer | null): boolean {
 
 /**
  * Create a sender-side compression context for one stream direction.
- * write(buf) -> Promise<Buffer|null>, flush() -> Promise<Buffer|null>,
- * end()/destroy() for teardown.
+ * write(buf) -> Promise<Buffer|null>, end()/destroy() for teardown.
  */
 export function createCompressContext(algo: string, { level }: { level?: number | null } = {}): CompCtx {
   switch (algo) {
     case ALGO_NONE:
       return new PassCtx();
     case ALGO_DEFLATE:
+      // flush: Z_SYNC_FLUSH makes every write() emit a sync-flushed block
+      // (permessage-deflate style), so one write() per chunk is also the
+      // frame boundary; wire output stays a continuous sync-flushed
+      // raw-deflate stream.
       return new ZCtx(
-        zlib.createDeflateRaw({ level: level ?? 6, windowBits: 15, memLevel: 8 }),
-        zlib.constants.Z_SYNC_FLUSH,
+        zlib.createDeflateRaw({
+          level: level ?? 6, windowBits: 15, memLevel: 8, flush: zlib.constants.Z_SYNC_FLUSH,
+        }),
       );
     default:
       throw new Error(`unsupported compression algorithm: ${algo}`);
@@ -205,7 +191,7 @@ export function createDecompressContext(algo: string): CompCtx {
     case ALGO_NONE:
       return new PassCtx();
     case ALGO_DEFLATE:
-      return new ZCtx(zlib.createInflateRaw({ windowBits: 15 }), undefined);
+      return new ZCtx(zlib.createInflateRaw({ windowBits: 15 }));
     default:
       throw new Error(`unsupported compression algorithm: ${algo}`);
   }

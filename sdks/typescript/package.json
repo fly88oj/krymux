@@ -1,7 +1,7 @@
 {
   "name": "@krymux/sdk",
-  "version": "0.1.0",
-  "description": "Krymux TypeScript SDK — TLS 1.3 mTLS tunnels with Ed25519 identities, stream multiplexing and flow control; wire-compatible with the Rust and Node implementations.",
+  "version": "0.2.0",
+  "description": "Krymux TypeScript SDK \u2014 TLS 1.3 mTLS tunnels with Ed25519 identities, stream multiplexing and flow control; wire-compatible with the Rust and Node implementations.",
   "type": "module",
   "license": "MIT",
   "main": "./src/index.ts",
@@ -18,6 +18,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "example:echo": "tsx examples/echo.ts",
+    "test:isolation": "tsx scripts/test-stream-isolation.ts",
     "test:interop": "tsx scripts/interop-with-rust.ts"
   },
   "engines": {

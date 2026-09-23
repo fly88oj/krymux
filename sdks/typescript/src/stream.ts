@@ -48,6 +48,23 @@ interface SendItem {
 }
 
 /**
+ * Max DATA frames coalesced into one socket write — the TS cap of the shared
+ * bounded-per-write rule (see ../WRITER_CONTRACT.md).
+ */
+const TX_BATCH_FRAMES = 16;
+
+/**
+ * Scratch for 4-byte WINDOW deltas: encodeFrame() copies the payload into the
+ * outgoing frame synchronously, so one shared buffer covers every grant.
+ */
+const WINDOW_SCRATCH = Buffer.alloc(4);
+
+function windowPayload(delta: number): Buffer {
+  WINDOW_SCRATCH.writeUInt32BE(delta >>> 0, 0);
+  return WINDOW_SCRATCH;
+}
+
+/**
  * One logical full-duplex byte stream inside a MuxSession — a Node Duplex.
  * Client code normally obtains these from MuxSession.openStream() (initiator)
  * or the session's 'stream' event (responder, which must accept()/reject()).
@@ -70,6 +87,7 @@ export class TunnelStream extends Duplex {
   private _sendQ: SendItem[] = []; // [{wire, logical, cbs[], fin, off}]
   private _pumping = false;
   private _deliverChain: Promise<unknown> = Promise.resolve();
+  private _deliverPending = 0;
 
   private _pendingRx: Array<Buffer | null> = []; // buffered inbound when the readable buffer is full
   private _eofPushed = false;
@@ -132,9 +150,7 @@ export class TunnelStream extends Duplex {
     this._creditBatch = new Batch(
       (delta) => {
         if (this.destroyed) return;
-        const p = Buffer.alloc(4);
-        p.writeUInt32BE(delta >>> 0, 0);
-        this.mux._sendControl(FT.WINDOW, this.id, p);
+        this.mux._sendControl(FT.WINDOW, this.id, windowPayload(delta));
       },
       { threshold: Math.max(16384, Math.floor(rxWindow / 4)), intervalMs: 5 },
     );
@@ -218,10 +234,10 @@ export class TunnelStream extends Duplex {
       try {
         if (this.compression !== ALGO_NONE && chunk.length > 0) {
           this._comp ??= createCompressContext(this.compression, { level: this.compressionLevel });
-          const a = await this._comp.write(chunk);
-          const b = await this._comp.flush();
-          const parts = [a, b].filter((p): p is Buffer => !!p);
-          if (parts.length) wire = Buffer.concat(parts);
+          // one write() per chunk: the deflate context carries Z_SYNC_FLUSH,
+          // so each write() already ends on a sync-flushed frame boundary
+          const out = await this._comp.write(chunk);
+          if (out) wire = out;
         }
       } catch (err) {
         cb(err as Error);
@@ -242,13 +258,7 @@ export class TunnelStream extends Duplex {
     this._pumping = true;
     (async () => {
       try {
-        while (this._sendQ.length > 0 && !this.destroyed) {
-          const item = this._sendQ[0]!;
-          const done = await this._sendItem(item);
-          if (!done) break; // credits or connection backpressure; will re-pump
-          this._sendQ.shift();
-          for (const c of item.cbs) c();
-        }
+        await this._drainSendQ();
       } catch (err) {
         this._teardownError(err as Error);
       } finally {
@@ -259,46 +269,96 @@ export class TunnelStream extends Duplex {
   }
 
   /**
-   * Send one queue item (possibly across multiple DATA frames).
-   * Credits are charged incrementally in *logical* (decompressed) bytes and
-   * released by the receiver in the same unit, keeping the accounting symmetric
-   * even when compression slightly inflates incompressible payloads.
-   * Every frame of a compressed item carries FLAG.COMPRESSED — the receiver
-   * feeds each into its continuous decompression context.
-   * Returns true when fully sent; false when blocked on credits/backpressure.
-   * Resumable: per-item progress lives on the item itself.
+   * Send queued items (each possibly across multiple DATA frames), coalescing
+   * consecutive frames from the whole queue into single socket writes of up to
+   * TX_BATCH_FRAMES frames — the drain-only-queued burst shape shared by every
+   * SDK writer (see ../WRITER_CONTRACT.md). Credits are charged incrementally
+   * in *logical* (decompressed) bytes and released by the receiver in the same
+   * unit, keeping the accounting symmetric even when compression slightly
+   * inflates incompressible payloads. Every frame of a compressed item
+   * carries FLAG.COMPRESSED — the receiver feeds each into its continuous
+   * decompression context.
+   *
+   * A batch is flushed before any await that can block (credit wait, socket
+   * backpressure) and before returning, so per-stream frame ordering — and
+   * item callback ordering — is preserved: an item's write callbacks fire only
+   * after the write carrying its last frame has been accepted by the socket.
+   * Resumable: per-item progress lives on the item itself (off/charged), so a
+   * credit-blocked pump resumes where it stopped.
    */
-  private async _sendItem(item: SendItem): Promise<boolean> {
+  private async _drainSendQ(): Promise<void> {
     const maxData = this.mux.peerMaxDataFrame;
     const compressed = this.compression !== ALGO_NONE;
-    while (item.off < item.wire.length) {
-      if (item.charged < item.logical) {
-        if (this.txWindow <= 0) return false; // waiting for WINDOW credits
-        const charge = Math.min(this.txWindow, item.logical - item.charged);
-        this.txWindow -= charge;
-        item.charged += charge;
+    let batch: Buffer[] = [];
+    let batchFrames = 0;
+    let settled: SendItem[] = [];
+    const flush = async (): Promise<boolean> => {
+      // fire callbacks for items whose last frame is in this batch
+      const done = settled;
+      settled = [];
+      if (batch.length === 0) {
+        for (const it of done) { for (const c of it.cbs) c(); }
+        return true;
       }
-      const take = Math.min(maxData, item.wire.length - item.off);
-      const isLast = item.off + take >= item.wire.length;
-      let flags = 0;
-      if (compressed) flags |= FLAG.COMPRESSED;
-      if (item.fin && isLast) flags |= FLAG.FIN;
-      this.stats.framesTx++;
-      const ok = await this.mux._writeData(
-        this,
-        encodeFrame(FT.DATA, flags, this.id, item.wire.subarray(item.off, item.off + take)),
-      );
-      item.off += take;
-      if (!ok) return false; // mux socket backpressure; mux re-pumps on drain
+      const out = batch.length === 1 ? batch[0]! : Buffer.concat(batch);
+      batch = [];
+      const frames = batchFrames;
+      batchFrames = 0;
+      const ok = await this.mux._writeData(this, out, frames);
+      for (const it of done) { for (const c of it.cbs) c(); }
+      return ok;
+    };
+    let blocked = false;
+    for (;;) {
+      blocked = false; // fresh drain round; credits may have arrived while parked
+      while (this._sendQ.length > 0 && !this.destroyed) {
+        const item = this._sendQ[0]!;
+        while (item.off < item.wire.length) {
+          if (item.charged < item.logical) {
+            if (this.txWindow <= 0) {
+              blocked = true; // waiting for WINDOW credits; addCredit re-pumps
+              break;
+            }
+            const charge = Math.min(this.txWindow, item.logical - item.charged);
+            this.txWindow -= charge;
+            item.charged += charge;
+          }
+          const take = Math.min(maxData, item.wire.length - item.off);
+          const isLast = item.off + take >= item.wire.length;
+          let flags = 0;
+          if (compressed) flags |= FLAG.COMPRESSED;
+          if (item.fin && isLast) flags |= FLAG.FIN;
+          this.stats.framesTx++;
+          batch.push(encodeFrame(FT.DATA, flags, this.id, item.wire.subarray(item.off, item.off + take)));
+          batchFrames++;
+          item.off += take;
+          if (batchFrames >= TX_BATCH_FRAMES) {
+            if (!(await flush())) return; // mux socket backpressure; mux re-pumps on drain
+          }
+        }
+        if (blocked) break;
+        if (item.fin && item.wire.length === 0) {
+          // standalone zero-length FIN frame (empty final chunk)
+          this.stats.framesTx++;
+          batch.push(encodeFrame(FT.DATA, FLAG.FIN, this.id, null));
+          batchFrames++;
+        }
+        if (item.fin) this._finSent = true;
+        this.stats.bytesTx += item.logical;
+        settled.push(item);
+        this._sendQ.shift();
+      }
+      // whatever accumulated must reach the socket before we park — a credit
+      // block or queue-drain must never drop already-encoded frames
+      await flush();
+      // Items — or WINDOW credits for a blocked item — may have arrived while
+      // flush() was parked on socket backpressure (their _pump() call was a
+      // no-op against the in-flight pumping flag), so re-check instead of
+      // trusting the pre-park state: exit only when done, destroyed, or
+      // genuinely out of credits (addCredit re-pumps when the grant lands).
+      if (this.destroyed || this._sendQ.length === 0) return;
+      if (blocked && this.txWindow <= 0) return;
     }
-    if (item.fin && item.wire.length === 0) {
-      // standalone zero-length FIN frame (empty final chunk)
-      this.stats.framesTx++;
-      await this.mux._writeData(this, encodeFrame(FT.DATA, FLAG.FIN, this.id, null));
-    }
-    if (item.fin) this._finSent = true;
-    this.stats.bytesTx += item.logical;
-    return true;
   }
 
   // ---------------- read path ----------------
@@ -306,11 +366,45 @@ export class TunnelStream extends Duplex {
   /**
    * Inbound frames must be applied strictly in arrival order (decompression
    * contexts are sequential and FIN must not overtake pending DATA), so every
-   * deliver() is chained onto a per-stream serial promise.
+   * deliver() is chained onto a per-stream serial promise. Uncompressed
+   * frames take a synchronous fast path when the chain is idle: the step has
+   * no await, so running it inline on the parser thread preserves order and
+   * skips the per-frame promise-chain allocation (bulk DATA is uncompressed
+   * more often than not).
    */
   deliver(payload: Buffer | null, flags: number): void {
+    if (this._deliverPending === 0 && !(flags & FLAG.COMPRESSED)) {
+      if (!this.destroyed && !this._eofPushed) {
+        try {
+          this._deliverInbound(payload, (flags & FLAG.FIN) !== 0);
+        } catch (err) {
+          // A user 'data'/'end' handler throwing synchronously out of push()
+          // must tear down only THIS stream, never escalate to a session
+          // GOAWAY (the parser would otherwise treat it as a protocol error).
+          this._teardownError(err as Error);
+        }
+      }
+      return;
+    }
+    this._deliverPending++;
     const run = this._deliverChain.then(() => this._deliverStep(payload, flags));
     this._deliverChain = run.catch((err: Error) => this._teardownError(err));
+    void run.finally(() => { this._deliverPending--; });
+  }
+
+  /** Shared inbound tail: buffer plain bytes, mark FIN, feed the readable side. */
+  private _deliverInbound(buf: Buffer | null, fin: boolean): void {
+    this.stats.framesRx++;
+    if (buf && buf.length > 0) {
+      this.stats.bytesRx += buf.length;
+      this._pendingRx.push(buf);
+    }
+    if (fin) {
+      this._finReceived = true;
+      this._pendingRx.push(null);
+    }
+    if (this._pendingRx.length > 0) this._flushPendingRx();
+    else this._maybeAutoDestroy();
   }
 
   private async _deliverStep(payload: Buffer | null, flags: number): Promise<void> {
@@ -326,14 +420,7 @@ export class TunnelStream extends Duplex {
       this._teardownError(err as Error);
       return;
     }
-    this.stats.framesRx++;
-    if (buf && buf.length > 0) this.stats.bytesRx += buf.length;
-    const fin = (flags & FLAG.FIN) !== 0;
-    if (fin) this._finReceived = true;
-    if (buf && buf.length > 0) this._pendingRx.push(buf);
-    if (fin) this._pendingRx.push(null);
-    if (this._pendingRx.length > 0) this._flushPendingRx();
-    else this._maybeAutoDestroy();
+    this._deliverInbound(buf, (flags & FLAG.FIN) !== 0);
   }
 
   override _read(_size: number): void {
@@ -420,9 +507,7 @@ export class TunnelStream extends Duplex {
       this._rxGranted += bonus;
       this._consumedSinceGrow = 0;
       this._growAt = Date.now();
-      const p = Buffer.alloc(4);
-      p.writeUInt32BE(bonus >>> 0, 0);
-      this.mux._sendControl(FT.WINDOW, this.id, p);
+      this.mux._sendControl(FT.WINDOW, this.id, windowPayload(bonus));
     }, wait);
     this._growRetryTimer.unref();
   }
@@ -500,6 +585,7 @@ export class TunnelStream extends Duplex {
     if (
       this._finSent && this._finReceived &&
       this._sendQ.length === 0 && !this._pumping &&
+      this._pendingRx.length === 0 && // EOF marker still queued: not safe to destroy yet
       (this.readableEnded || this.readableLength === 0)
     ) {
       setImmediate(() => {

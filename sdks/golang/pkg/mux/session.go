@@ -38,6 +38,10 @@ const (
 	creditTick     = 5 * time.Millisecond
 	maxExpansion   = 32 << 20 // decompressed-chunk expansion cap (attack guard)
 	writerBatchCap = 256 * 1024
+	// max frames coalesced into one write: bounds queuing latency when a
+	// burst of tiny frames (WINDOW credits) is pending — the Go caps of the
+	// shared bounded-per-write rule (see ../../WRITER_CONTRACT.md)
+	writerBatchFrames = 16
 )
 
 // ErrSessionClosed is returned once the session has been torn down (by
@@ -432,33 +436,53 @@ func nowMs() int64 {
 	return time.Now().UnixMilli()
 }
 
+// writeFrameBatch flushes a coalesced run of frames with one writev-style
+// call. On a plain TCP connection net.Buffers.WriteTo issues a single writev
+// syscall with no intermediate copy (unlike concatenating into one buffer);
+// on other conns (e.g. *tls.Conn) it degrades to sequential writes, which is
+// still correct — crypto/tls re-chunks every write into records anyway.
+func (s *Session) writeFrameBatch(frames [][]byte) error {
+	if len(frames) == 1 {
+		_, err := s.conn.Write(frames[0])
+		return err
+	}
+	buf := net.Buffers(frames)
+	_, err := buf.WriteTo(s.conn)
+	return err
+}
+
 func (s *Session) writeLoop() {
+	var batch [][]byte
+	batchBytes := 0
 	for {
-		var batch []byte
 		select {
 		case f := <-s.writeCh:
-			batch = append(batch, f...)
+			batch = append(batch, f)
+			batchBytes = len(f)
 		case <-s.doneCh:
 			// drain whatever is already queued (GOAWAY included), then stop
-			s.drainAndClose(nil)
+			s.drainAndClose()
 			return
 		}
-		// coalesce an already-queued burst into one write
-		for len(batch) < writerBatchCap {
+		// coalesce an already-queued burst into one writev
+		for batchBytes < writerBatchCap && len(batch) < writerBatchFrames {
 			select {
 			case f := <-s.writeCh:
-				batch = append(batch, f...)
+				batch = append(batch, f)
+				batchBytes += len(f)
 			default:
 				goto write
 			}
 		}
 	write:
-		if _, err := s.conn.Write(batch); err != nil {
+		if err := s.writeFrameBatch(batch); err != nil {
 			s.fatal(false, "")
 			return
 		}
+		batch = batch[:0]
+		batchBytes = 0
 		if s.closing.Load() {
-			s.drainAndClose(nil)
+			s.drainAndClose()
 			return
 		}
 	}
@@ -466,19 +490,19 @@ func (s *Session) writeLoop() {
 
 // drainAndClose flushes any frames still sitting in writeCh and closes the
 // socket; the session is over either way, so a write error here is fine.
-func (s *Session) drainAndClose(extra []byte) {
-	batch := extra
+func (s *Session) drainAndClose() {
+	var batch [][]byte
 	for {
 		select {
 		case f := <-s.writeCh:
-			batch = append(batch, f...)
+			batch = append(batch, f)
 			continue
 		default:
 		}
 		break
 	}
 	if len(batch) > 0 {
-		_, _ = s.conn.Write(batch)
+		_ = s.writeFrameBatch(batch)
 	}
 	_ = s.conn.Close()
 }
@@ -486,6 +510,11 @@ func (s *Session) drainAndClose(extra []byte) {
 func (s *Session) readLoop() {
 	hdr := make([]byte, frame.HeaderSize)
 	ourMaxData := int(frame.DefaultMaxData)
+	// Payload scratch grown on demand and reused across frames: every
+	// consumer (decompress feed, deliver's rbuf copy, JSON decode, PONG echo)
+	// copies out of it synchronously, so the per-frame allocation is pure
+	// waste under bulk DATA (256 x 64 KiB per 16 MiB otherwise).
+	var scratch []byte
 	for {
 		if _, err := io.ReadFull(s.conn, hdr); err != nil {
 			s.fatal(false, "")
@@ -502,7 +531,10 @@ func (s *Session) readLoop() {
 			s.fatal(false, "")
 			return
 		}
-		payload := make([]byte, h.Length)
+		if int(h.Length) > cap(scratch) {
+			scratch = make([]byte, h.Length)
+		}
+		payload := scratch[:h.Length]
 		if len(payload) > 0 {
 			if _, err := io.ReadFull(s.conn, payload); err != nil {
 				s.fatal(false, "")

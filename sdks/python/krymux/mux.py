@@ -45,7 +45,15 @@ HELLO_TIMEOUT = 10.0
 CREDIT_TICK = 0.05
 #: Expansion bound on one decompressed chunk (compression-bomb guard).
 MAX_EXPANSION = 32 * 1024 * 1024
-
+#: Upper bound on frames parked in the session writer queue. Bounded so a
+#: stalled transport backpressures the frame producers (stream writes await
+#: ``_send_frame``) instead of growing the queue without limit. Per-runtime
+#: write caps are part of the shared writer contract (sdks/WRITER_CONTRACT.md).
+_WRITER_QUEUE_FRAMES = 256
+#: Upper bound on wire bytes coalesced into one transport write by the
+#: session writer task (a byte cap; the Rust writer caps FRAMES instead —
+#: see sdks/WRITER_CONTRACT.md).
+_WRITER_BATCH_BYTES = 256 * 1024
 
 class KrymuxError(Exception):
     """Base class for krymux SDK errors."""
@@ -123,6 +131,7 @@ class _Stream:
         self._bypassed = False  # sniff switched compression off: frames unflagged
         # receive side (toward the app)
         self.buf = bytearray()
+        self.buf_off = 0  # consumed prefix of buf (compacted lazily)
         self.data_event: asyncio.Event = asyncio.Event()
         self.eof = False
         self.aborted = False
@@ -136,6 +145,11 @@ class _Stream:
         self.ack: asyncio.Future | None = None
         self.ack_done = False
 
+    @property
+    def buffered(self) -> int:
+        """Unconsumed receive-side bytes."""
+        return len(self.buf) - self.buf_off
+
     def compress_chunk(self, data: bytes) -> tuple[bytes, bool]:
         """Compress one logical chunk; returns (wire_bytes, compressed_flag)."""
         if not self._sniffed:
@@ -144,7 +158,8 @@ class _Stream:
                 self._compressor = Compressor(compress.ALGO_NONE)
                 self._bypassed = True
         if self.compression == compress.ALGO_NONE or self._bypassed:
-            return bytes(data), False
+            # data is already an immutable bytes slice; no defensive copy needed
+            return data, False
         return self._compressor.push(data), True
 
     def decompress_chunk(self, wire: bytes) -> bytes:
@@ -183,22 +198,39 @@ class TunnelStream:
         return str(self._st.target)
 
     # -- receive -----------------------------------------------------------
-    async def read(self, n: int = 65536) -> bytes:
-        """Read up to ``n`` bytes; ``b""`` means EOF (clean or aborted)."""
+    async def read(self, n: int | None = 65536) -> bytes:
+        """Read up to ``n`` bytes; ``b""`` means EOF (clean or aborted).
+
+        ``n=None`` drains the whole receive buffer (v0.1.0 semantics).
+        """
         if n is not None and n <= 0:
             raise ValueError("n must be positive")
         st = self._st
-        while not st.buf and not st.eof:
+        while st.buffered == 0 and not st.eof:
             if self._session.is_closed:
                 break
             st.data_event.clear()
-            if st.buf or st.eof:
+            if st.buffered or st.eof:
                 break
             await st.data_event.wait()
-        if not st.buf:
+        avail = st.buffered
+        if avail == 0:
             return b""
-        out = bytes(st.buf[:n])
-        del st.buf[:n]
+        if n is None or n > avail:
+            n = avail
+        # one copy out of the bytearray; consumption advances an offset and
+        # only compacts once the consumed prefix is at least half the buffer
+        # (a plain ``del buf[:n]`` per read would memmove the whole remainder,
+        # quadratic for apps that buffer a large stream before reading it)
+        out = bytes(memoryview(st.buf)[st.buf_off : st.buf_off + n])
+        st.buf_off += n
+        if st.buf_off == len(st.buf):
+            st.buf.clear()
+            st.buf_off = 0
+        elif st.buf_off * 2 >= len(st.buf):
+            del st.buf[:st.buf_off]
+            st.buf_off = 0
+        await self._session._grant_credit(st, n)
         return out
 
     async def read_all(self) -> bytes:
@@ -225,7 +257,8 @@ class TunnelStream:
             raise KrymuxError("stream aborted")
         session = self._session
         max_frame = min(session.peer_max_data, DEFAULT_MAX_DATA)
-        payload = bytes(data)
+        # bytes(data) would copy an already-immutable payload all over again
+        payload = data if type(data) is bytes else bytes(data)
         off = 0
         while off < len(payload):
             chunk = payload[off : off + max_frame]
@@ -327,7 +360,7 @@ class Session:
         self._ready = asyncio.Event()
         self._closed = False
         self._closed_event = asyncio.Event()
-        self._wq: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._wq: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_WRITER_QUEUE_FRAMES)
         self._pings: dict[bytes, tuple[asyncio.Future, float]] = {}
         self._tasks: list[asyncio.Task] = []
         self._writer_task: asyncio.Task | None = None
@@ -441,11 +474,30 @@ class Session:
             item = await self._wq.get()
             if item is None:
                 break
+            # Coalesce whatever else is already queued into one transport
+            # write + one drain round-trip (drain-only-queued burst batching,
+            # per sdks/WRITER_CONTRACT.md): under bulk load the queue holds a
+            # backlog of frames and per-frame writes/drain checks dominate
+            # otherwise.
             try:
-                self._writer.write(item)
+                parts = [item]
+                total = len(item)
+                while total < _WRITER_BATCH_BYTES:
+                    try:
+                        nxt = self._wq.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:
+                        self._wq.put_nowait(None)  # re-arm the sentinel
+                        break
+                    parts.append(nxt)
+                    total += len(nxt)
+                self._writer.write(parts[0] if len(parts) == 1 else b"".join(parts))
                 await self._writer.drain()
             except (ConnectionError, OSError, asyncio.CancelledError):
                 break
+            if self._closed and self._wq.empty():
+                break  # teardown sentinel was dropped on a full queue; queue drained
         try:
             self._writer.close()
         except Exception:
@@ -509,7 +561,10 @@ class Session:
             if st is not None:
                 self._abort_stream(st, "peer close")
         elif fh.frame_type == FT_PING:
-            self._wq.put_nowait(encode_frame(FT_PONG, 0, 0, payload))
+            try:
+                self._wq.put_nowait(encode_frame(FT_PONG, 0, 0, payload))
+            except asyncio.QueueFull:
+                pass  # writer backed up; the peer's keepalive re-pings
         elif fh.frame_type == FT_PONG:
             if len(payload) == 16:
                 entry = self._pings.pop(payload, None)
@@ -548,7 +603,10 @@ class Session:
 
         def nack(code: str, reason: str) -> None:
             body = json.dumps({"ok": False, "code": code, "reason": reason})
-            self._wq.put_nowait(encode_frame(FT_OPEN_ACK, 0, fh.stream_id, body.encode()))
+            try:
+                self._wq.put_nowait(encode_frame(FT_OPEN_ACK, 0, fh.stream_id, body.encode()))
+            except asyncio.QueueFull:
+                pass  # bounded writer queue; the opener times out instead
 
         if len(self.streams) >= self.opts.max_streams:
             nack("maxstreams", f"limit {self.opts.max_streams}")
@@ -587,16 +645,19 @@ class Session:
                     pass
         finally:
             st.app_done = True
-            if not st.ack_done:
-                st.ack_done = True
-                body = json.dumps({"ok": False, "code": "internal", "reason": "handler exited without a verdict"})
-                self._wq.put_nowait(encode_frame(FT_OPEN_ACK, 0, st.id, body.encode()))
-            if not st.write_closed and not st.eof:
-                # handler gone without a clean FIN: abort so the peer does not
-                # mistake truncation for EOF
-                self._wq.put_nowait(
-                    encode_frame(FT_CLOSE, 0, st.id, json.dumps({"code": "abort"}).encode())
-                )
+            try:
+                if not st.ack_done:
+                    st.ack_done = True
+                    body = json.dumps({"ok": False, "code": "internal", "reason": "handler exited without a verdict"})
+                    self._wq.put_nowait(encode_frame(FT_OPEN_ACK, 0, st.id, body.encode()))
+                if not st.write_closed and not st.eof:
+                    # handler gone without a clean FIN: abort so the peer does not
+                    # mistake truncation for EOF
+                    self._wq.put_nowait(
+                        encode_frame(FT_CLOSE, 0, st.id, json.dumps({"code": "abort"}).encode())
+                    )
+            except asyncio.QueueFull:
+                pass  # bounded writer queue; the teardown paths cope
             self._maybe_retire(st)
 
     def _handle_open_ack(self, fh, payload: bytes) -> None:
@@ -623,24 +684,24 @@ class Session:
         fin = bool(fh.flags & FLAG_FIN)
         if payload:
             try:
-                plain = st.decompress_chunk(payload) if compressed else bytes(payload)
+                # payload is a fresh bytes from the reader; no copy needed for
+                # the uncompressed path
+                plain = st.decompress_chunk(payload) if compressed else payload
             except Exception:
-                self._wq.put_nowait(
-                    encode_frame(FT_CLOSE, 0, st.id, json.dumps({"code": "abort"}).encode())
-                )
+                try:
+                    self._wq.put_nowait(
+                        encode_frame(FT_CLOSE, 0, st.id, json.dumps({"code": "abort"}).encode())
+                    )
+                except asyncio.QueueFull:
+                    pass
                 self._abort_stream(st, "decompress error")
                 return
             if plain:
+                # No grant here: credits are returned on app consumption (see
+                # TunnelStream.read / Session._grant_credit), which bounds
+                # st.buf to the advertised window even for slow readers.
                 st.buf += plain
                 st.data_event.set()
-                st.pending_credit += len(plain)
-                threshold = max(self.opts.rx_window // 4, 16 * 1024)
-                if st.pending_credit >= threshold:
-                    delta = st.pending_credit
-                    st.pending_credit = 0
-                    self._wq.put_nowait(
-                        encode_frame(FT_WINDOW, 0, st.id, delta.to_bytes(4, "big"))
-                    )
         if fin:
             tail = st.finish_decompress()
             if tail:
@@ -657,6 +718,23 @@ class Session:
         if st is not None:
             st.credits += delta
             st.credit_event.set()
+
+    async def _grant_credit(self, st: "_Stream", n: int) -> None:
+        """Credit-on-consumption: return consumed logical bytes to the peer
+        once the threshold is crossed (the credit ticker flushes sub-threshold
+        tails). This is what paces the sender — the receive buffer stays
+        bounded by the advertised window even for slow readers, matching the
+        Rust/Go/TS SDKs (see sdks/WRITER_CONTRACT.md)."""
+        st.pending_credit += n
+        threshold = max(self.opts.rx_window // 4, 16 * 1024)
+        if st.pending_credit < threshold:
+            return
+        delta = st.pending_credit
+        st.pending_credit = 0
+        try:
+            await self._send_frame(FT_WINDOW, 0, st.id, delta.to_bytes(4, "big"))
+        except Exception:
+            st.pending_credit += delta  # never lose consumed-but-ungranted bytes
 
     # -- stream state helpers ---------------------------------------------------
     def _abort_stream(self, st: _Stream, why: str) -> None:

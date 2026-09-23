@@ -363,7 +363,13 @@ func (st *Stream) grantCredit(n uint32) {
 	if st.pending >= st.threshold {
 		d := st.pending
 		st.pending = 0
-		st.sess.sendWindow(st.id, d)
+		if !st.sess.sendWindow(st.id, d) {
+			// writer queue full / session gone: put the credit back for the
+			// tail flusher (flushCreditTail retries every tick) — a silently
+			// dropped grant would permanently stall the peer's sender. The
+			// Rust reference restores the delta the same way.
+			st.pending += d
+		}
 	}
 }
 

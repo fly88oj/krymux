@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [0.2.0] - 2026-09-23
+
+### Fixed (multi-language SDK review round)
+- TypeScript: a synchronous throw from a user `'data'` handler now tears down only
+  that stream (v0.2.0 escalated it to a whole-session GOAWAY); dead push()/flush()
+  compression machinery removed.
+- Python: `read(None)` regression (TypeError) restored to drain-all semantics;
+  **credit grants now happen on app consumption** (was frame arrival) — receive
+  memory is bounded for slow readers and the writer queue is capped (256 frames),
+  closing the broken backpressure chain; benchmarks interleaved to match. With
+  correct backpressure, 16 MiB none throughput doubled (171 → 341 MiB/s — the old
+  write-all-then-read pattern hid an end-of-transfer stall).
+- Go: a WINDOW credit grant that hits a full writer queue is restored to the
+  pending tail instead of being silently dropped (could permanently stall a peer).
+
+### Added
+- `sdks/WRITER_CONTRACT.md`: the single normative writer contract (drain-only-queued,
+  bounded per-write, flush-before-park, flush-on-teardown, credit-on-consumption)
+  referenced by all three SDKs; TS stream-isolation regression test.
+
+### Changed
+- **TypeScript SDK**: the stream writer now coalesces queued DATA frames into
+  single socket writes (up to 16 frames per write, mirroring the Rust writer
+  task), with one backpressure round-trip per batch instead of per frame.
+  Uncompressed inbound frames take a synchronous fast path instead of a
+  per-frame promise chain, and each deflate chunk is compressed with a single
+  transform round-trip. Bulk echo throughput improves ~1.7x (16 MiB) to ~6x
+  (1 MiB) depending on payload; wire protocol unchanged.
+- **Go SDK**: the session writer flushes coalesced frame bursts with
+  `net.Buffers` (writev on TCP, no intermediate concat copy) and the reader
+  reuses its payload buffer across frames instead of allocating per frame.
+  Bulk echo throughput improves up to ~2.4x; wire protocol unchanged.
+- **Python SDK**: the session writer coalesces the queued frames behind one
+  transport write + drain per wakeup, the receive buffer consumes by offset
+  with amortized compaction (no more O(n) memmove per read on large buffered
+  streams), and several per-frame defensive copies were removed. Bulk echo
+  throughput improves ~1.1-1.2x; wire protocol unchanged.
+
+### Added
+- Echo throughput benchmarks for the TypeScript, Go and Python SDKs
+  (`sdks/<lang>/bench/echo.*`): 1 MiB and 16 MiB payloads, none and deflate,
+  median of 3 runs, prints MiB/s. Measures the mux/stream data path over
+  loopback TCP with both sessions in-process (no TLS, which is runtime-
+  internal and unaffected by these changes).
 ## [0.1.0] - 2026-09-22
 
 Initial public release (previously developed under an internal name).
@@ -78,7 +123,7 @@ Initial public release (previously developed under an internal name).
   every compressed stream carrying already-compressed content.
 - WS ping frames were never answered (and killed the connection during auth).
 
-## [0.2.0] - 2026-09-21
+## [0.2.0-pre] - 2026-09-21 (pre-rename)
 
 ### Added
 

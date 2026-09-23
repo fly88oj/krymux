@@ -278,6 +278,12 @@ export class MuxSession extends EventEmitter {
 
   // ---------------- writing ----------------
 
+  // Control frames deliberately bypass the streams' DATA batching: each is a
+  // single small frame written straight to the socket. Ordering stays correct
+  // because the one socket serializes writes (a control frame issued between
+  // two of a stream's batch flushes can never be reordered past them), and
+  // holding a WINDOW/OPEN_ACK/GOAWAY behind a credit-blocked stream batch
+  // would add latency exactly when the peer is waiting on it.
   _sendControl(type: number, sid: number, payload: Buffer | null): void {
     if (this._gone && type !== FT.GOAWAY) return;
     const frame = encodeFrame(type, 0, sid, payload ?? null);
@@ -287,12 +293,15 @@ export class MuxSession extends EventEmitter {
   }
 
   /**
-   * Write a DATA frame on behalf of a stream. Returns (a promise for) true when
-   * written; if the socket is backpressured, waits for drain and then returns true.
-   * Order relative to other frames is preserved by the single socket.
+   * Write DATA frame(s) on behalf of a stream. `frame` is one already-encoded
+   * frame or a coalesced run of frames (frameCount of them) built by the
+   * stream's send path; the wire bytes are identical either way. Returns (a
+   * promise for) true when written; if the socket is backpressured, waits for
+   * drain and then returns true. Order relative to other frames is preserved
+   * by the single socket.
    */
-  async _writeData(_stream: TunnelStream, frame: Buffer): Promise<boolean> {
-    this.stats.framesTx++;
+  async _writeData(_stream: TunnelStream, frame: Buffer, frameCount = 1): Promise<boolean> {
+    this.stats.framesTx += frameCount;
     this.stats.wireBytesTx += frame.length;
     const ok = this.socket.write(frame);
     if (ok) return true;
@@ -436,7 +445,14 @@ export class MuxSession extends EventEmitter {
     if (payload && payload.length > this.rxWindow + HARD_MAX_FRAME) {
       throw new ProtocolError('DATA exceeds window bounds');
     }
-    stream.deliver(payload, flags);
+    try {
+      stream.deliver(payload, flags);
+    } catch (err) {
+      // Belt-and-braces to TunnelStream.deliver's own guard: a synchronous
+      // throw out of a per-stream handler must tear down only that stream,
+      // not escalate to a whole-session GOAWAY.
+      stream._teardownError(err as Error);
+    }
   }
 
   private _onWindow(sid: number, payload: Buffer | null): void {
@@ -453,7 +469,13 @@ export class MuxSession extends EventEmitter {
     if (!stream) return;
     const code = payload && payload.length > 0 ? payload[0]! : CLOSE_CODES.CANCEL;
     const reason = payload && payload.length > 1 ? payload.subarray(1).toString('utf8') : '';
-    stream.peerClosed(code, reason);
+    try {
+      stream.peerClosed(code, reason);
+    } catch (err) {
+      // user 'end'/'close' handlers firing synchronously out of push(null):
+      // same per-stream isolation as _onData, never a session GOAWAY
+      stream._teardownError(err as Error);
+    }
   }
 
   private _onPong(payload: Buffer | null): void {

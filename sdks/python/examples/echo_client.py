@@ -40,9 +40,13 @@ async def main() -> None:
     t0 = time.monotonic()
     stream = await client.open_stream(args.host, args.port, compression=args.compression)
     print(f"stream open (compression={stream.compression}) -> {stream.remote_address}")
+    # Drain the echo concurrently with writing: the peer re-grants window
+    # credits only as we consume data, so writing everything before the first
+    # read would park on the receive window mid-transfer.
+    echo = asyncio.ensure_future(stream.read_all())
     await stream.write(payload)
     await stream.close_write()
-    got = await stream.read_all()
+    got = await echo
     dt = time.monotonic() - t0
 
     ok = got == payload

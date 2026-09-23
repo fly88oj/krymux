@@ -196,9 +196,13 @@ async def _phase_a() -> None:
         for algo in ("none", "deflate"):
             stream = await client.open_stream("echo", 9, compression=algo)
             assert stream.compression == algo, f"negotiated {stream.compression}, want {algo}"
+            # interleave: the Rust server re-grants credits on consumption,
+            # so the echo must be drained while writing (write-all-then-read
+            # would park on the receive window mid-transfer)
+            echo = asyncio.get_event_loop().create_task(stream.read_all())
             await stream.write(payload)
             await stream.close_write()
-            got = await stream.read_all()
+            got = await echo
             assert got == payload, f"{algo}: echo not byte-exact ({len(got)} != {len(payload)})"
             PASS.append(f"A: echo {algo} 1MB+ byte-exact (python client -> rust server)")
 
